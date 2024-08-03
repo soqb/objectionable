@@ -100,7 +100,7 @@ use std::{
 /// but will always be accurately documented.
 ///
 /// Types are considered small enough to store inline
-/// if they habe both of the following properties:
+/// if they have both of the following properties:
 /// * A size less no more than the `N` generic parameter.
 /// * An alignment no more than than 8.
 ///   - Note, there is a generic parameter (`A`) intended for altering this limit,
