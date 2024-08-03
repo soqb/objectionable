@@ -4,7 +4,7 @@
 )]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
-//! Objectionable storage of `?Sized` types inline inside of allocated objects.
+//! Objectionable storage of `?Sized` types inline inside allocated objects.
 //!
 //! See [`BigBox`] for the crate's central API.
 //!

@@ -1,6 +1,6 @@
-#  Objectionable storage of `?Sized` types inline inside of allocated objects.
+# objectionable storage of `?Sized` types inline inside allocated objects.
 
-See [docs.rs](https://docs.rs/objectionable) for documentation and examples.
+See [the documentation](https://docs.rs/objectionable) for usage and examples.
 
 # License
 
