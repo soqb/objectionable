@@ -4,6 +4,7 @@
 )]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(missing_docs)]
+#![cfg_attr(not(test), no_std)]
 //! Objectionable storage of `?Sized` types inline inside allocated objects.
 //!
 //! See [`BigBox`] for the crate's central API.
@@ -79,12 +80,19 @@
 //! assert_eq!(Character::personality(boxed.as_ref()), "enormous");
 //! ```
 
-use std::{
+use core::{
     alloc::Layout,
     cell::UnsafeCell,
     mem::{self, ManuallyDrop, MaybeUninit},
     ptr,
 };
+
+use alloc::{
+    alloc::{alloc, handle_alloc_error},
+    boxed::Box,
+};
+
+extern crate alloc;
 
 /// Similar to `Box<T>`, but stores small values inline.
 ///
@@ -160,9 +168,9 @@ fn take_into_box<T: ?Sized, const N: usize, const A: usize>(
         #[cfg(any(feature = "strict-provenance", miri))]
         ptr::without_provenance_mut(layout.align())
     } else {
-        let alloc = unsafe { std::alloc::alloc(layout) };
+        let alloc = unsafe { alloc(layout) };
         if alloc.is_null() {
-            std::alloc::handle_alloc_error(layout)
+            handle_alloc_error(layout);
         }
 
         alloc
