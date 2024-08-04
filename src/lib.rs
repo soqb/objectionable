@@ -253,7 +253,7 @@ pub enum BoxCapture<T: ?Sized, const N: usize, const A: usize> {
 /// The in-memory layout of this type should not be relied upon,
 /// and should be considered unstable.
 ///
-/// [(small)]: Self#which-values-can-be-stored-inline
+/// [(small)]: BigBox#which-values-can-be-stored-inline
 #[cfg_attr(not(doc), repr(transparent))]
 pub struct InlineBox<T: ?Sized, const N: usize, const A: usize> {
     inner: ManuallyDrop<BigBox<T, N, A>>,
