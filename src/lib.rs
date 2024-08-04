@@ -81,9 +81,8 @@
 
 use std::{
     alloc::Layout,
-    borrow::{Borrow, BorrowMut},
     cell::UnsafeCell,
-    mem::{forget, transmute, ManuallyDrop, MaybeUninit},
+    mem::{self, MaybeUninit},
     ptr,
 };
 
@@ -102,17 +101,16 @@ use std::{
 ///
 /// Types are considered small enough to store inline
 /// if they have both of the following properties:
-/// * A size less no more than the `N` generic parameter.
+/// * A size no more than the `N` generic parameter.
 /// * An alignment no more than than 8.
 ///   - Note, there is a generic parameter (`A`) intended for altering this limit,
 ///     but due to language restrictions, it cannot currently be used.
 ///
 /// # Layout
 ///
-/// Note that while this type is *currently* annotated with `repr(C)`,
-/// this cannot be relied upon.
-/// The type should be considered to have an unstable layout.
-#[repr(C, align(8))]
+/// The in-memory layout of this type should not be relied upon,
+/// and should be considered unstable.
+#[cfg_attr(not(doc), repr(C, align(8)))]
 pub struct BigBox<T: ?Sized, const N: usize, const A: usize = 8> {
     inline: UnsafeCell<[MaybeUninit<u8>; N]>,
     // if the data ptr of `boxed` is non-null,
@@ -142,26 +140,25 @@ fn copy_metadata<T: ?Sized>(meta_ptr: *const T, data_ptr: *const u8) -> *const T
     return ptr::from_raw_parts(data_ptr, ptr::metadata(meta_ptr));
 }
 
-fn take_into_box<T: ?Sized, const N: usize, const A: usize>(mut value: Take<T, N, A>) -> Box<T> {
+fn take_into_box<T: ?Sized, const N: usize, const A: usize>(
+    mut value: InlineBox<T, N, A>,
+) -> Box<T> {
     // we have to implement `Box::new` manually because all this is all FREAKISH
     // and EVIL.
 
-    let layout = Layout::for_value::<T>(value.borrow());
+    let layout = Layout::for_value::<T>(value.as_ref());
 
     let alloc: *mut u8 = if layout.size() == 0 {
+        // NB: we're not going through the "canonical"
+        // way of constructing a ZST pointer (`NonNull::dangling`)
+        // because we don't have static access to the value's layout.
+        #[cfg(not(any(feature = "strict-provenance", miri)))]
         // SAFETY: GOD this is HORRIBLE i HATE EVERYTHING.
-        // * first, this *should* be safe, and definitely is unlikely to break,
-        //   but we should note we're not going through the "canonical"
-        //   way of constructing a ZST pointer (`NonNull::dangling`)
-        //  because we don't have static access to the value's layout.
         unsafe {
-            #[cfg(not(any(feature = "strict-provenance", miri)))]
-            let ptr = transmute(layout.align());
-            #[cfg(any(feature = "strict-provenance", miri))]
-            let ptr = ptr::without_provenance_mut(layout.align());
-
-            ptr
+            mem::transmute(layout.align())
         }
+        #[cfg(any(feature = "strict-provenance", miri))]
+        ptr::without_provenance_mut(layout.align())
     } else {
         let alloc = unsafe { std::alloc::alloc(layout) };
         if alloc.is_null() {
@@ -171,7 +168,7 @@ fn take_into_box<T: ?Sized, const N: usize, const A: usize>(mut value: Take<T, N
         alloc
     };
 
-    let ptr = ptr::from_mut::<T>(value.borrow_mut()) as *mut T;
+    let ptr = ptr::from_mut::<T>(value.as_mut()) as *mut T;
     unsafe { alloc.copy_from_nonoverlapping(ptr.cast(), layout.size()) };
 
     let alloc = copy_metadata(ptr, alloc).cast_mut();
@@ -239,34 +236,66 @@ pub enum BoxCapture<T: ?Sized, U> {
     Inline(U),
 }
 
-/// A reference to a value which is dropped at the end of the reference's lifetime.
-pub struct Take<'a, T: ?Sized, const N: usize, const A: usize> {
-    pub(self) inner: &'a mut ManuallyDrop<T>,
+/// A box which stores its [(small)] value inline.
+///
+/// This is identical to a [`BigBox`] which is obligated to store its contents inline.
+///
+/// # Layout
+///
+/// The in-memory layout of this type should not be relied upon,
+/// and should be considered unstable.
+#[cfg_attr(not(doc), repr(transparent))]
+pub struct InlineBox<T: ?Sized, const N: usize, const A: usize> {
+    pub(self) inner: BigBox<T, N, A>,
 }
 
-impl<'a, T: ?Sized, const N: usize, const A: usize> Take<'a, T, N, A> {
+impl<T: ?Sized, const N: usize, const A: usize> InlineBox<T, N, A> {
     /// # Safety
     ///
-    /// The value behind `ptr` must not be used again.
-    unsafe fn from_ptr(ptr: *mut T) -> Self {
-        let ptr = ptr as *mut ManuallyDrop<T>;
-        let inner = unsafe { ptr.as_mut().unwrap_unchecked() };
-        Self { inner }
-    }
-
-    /// Converts this reference to a pointer.
-    pub fn as_ptr(&mut self) -> *mut T {
-        ptr::from_mut(self.inner) as *mut T
+    /// The `BigBox` must have its value stored inline.
+    unsafe fn from_big_box(big_box: BigBox<T, N, A>) -> Self {
+        debug_assert!(big_box.is_inline());
+        Self { inner: big_box }
     }
 
     /// Turns this reference into a [`BigBox`] identical to the one it was constructed from.
-    pub fn into_big_box(mut self) -> BigBox<T, N, A> {
-        // SAFETY:
-        // * value is not used after this call (is forgotten).
-        // * the pointer is valid for reads (`as_ptr` comes thinly from reference).
-        let boxed = unsafe { BigBox::copy_inline(self.as_ptr()) };
-        forget(self);
-        boxed
+    pub fn into_big_box(self) -> BigBox<T, N, A> {
+        self.inner
+    }
+
+    /// Attempts to construct an [`InlineBox`], failing if the value is not [small].
+    ///
+    /// This function will never allocate,
+    /// instead it will return an `Err` variant which the passed value can be recovered from.
+    ///
+    /// [small]: BigBox#which-values-can-be-stored-inline
+    pub fn try_new<U>(v: U) -> Result<Self, U>
+    where
+        T: FromSized<U>,
+    {
+        if size_of::<U>() > N || align_of::<U>() > 8 {
+            return Err(v);
+        }
+
+        // NB: `boxed` is null, but has the metadata of `T`.
+        let boxed = T::fatten_pointer(ptr::null_mut::<U>());
+        let mut inst = BigBox::uninit_from_boxed(boxed);
+
+        // SAFETY: This write is safe bceause:
+        // * `ptr` is non-null and live because it points into the `inline`
+        //   field of the stack-allocated `inst` object.
+        // * `ptr` is derefenceable because `T` is not bigger than `inline`.
+        // * `ptr` is correctly aligned because:
+        //   - `inst` is aligned to 8 bytes.
+        //   - Because of `repr(C)`, the same is true for the `inline` field.
+        //   - `T` must be aligned to no more than 8 bytes.
+        let ptr: *mut U = ptr::addr_of_mut!(inst.inline).cast();
+        unsafe { ptr.write(v) };
+
+        // SAFETY: `inst` is constructed inline:
+        // * `boxed` is explicitly null with the metadata for type `U`.
+        // * `inline` has been written to with an accurate value of type `U`.
+        Ok(unsafe { Self::from_big_box(inst) })
     }
 
     /// Reads the value from behind the reference.
@@ -286,27 +315,22 @@ impl<'a, T: ?Sized, const N: usize, const A: usize> Take<'a, T, N, A> {
         // SAFETY:
         // * `Take` contract upholds the backing value is not used again.
         // * The caller contract ensures the cast is valid.
-        let read = unsafe { ptr::read(self.as_ptr().cast()) };
-        forget(self);
+        let read = unsafe { ptr::read(self.inner.inline_ptr_mut().cast()) };
+        mem::forget(self);
         read
     }
 }
 
-impl<'a, T: ?Sized, const N: usize, const A: usize> Borrow<T> for Take<'a, T, N, A> {
-    fn borrow(&self) -> &T {
-        self.inner
+impl<T: ?Sized, const N: usize, const A: usize> AsRef<T> for InlineBox<T, N, A> {
+    fn as_ref(&self) -> &T {
+        // SAFETY: The type's contract ensures the value is always stored inline.
+        unsafe { self.inner.inline_ptr().as_ref().unwrap_unchecked() }
     }
 }
-impl<'a, T: ?Sized, const N: usize, const A: usize> BorrowMut<T> for Take<'a, T, N, A> {
-    fn borrow_mut(&mut self) -> &mut T {
-        self.inner
-    }
-}
-
-impl<'a, T: ?Sized, const N: usize, const A: usize> Drop for Take<'a, T, N, A> {
-    fn drop(&mut self) {
-        // SAFETY: `Take` contract upholds that the backing value is not used again.
-        unsafe { ManuallyDrop::<T>::drop(&mut self.inner) };
+impl<T: ?Sized, const N: usize, const A: usize> AsMut<T> for InlineBox<T, N, A> {
+    fn as_mut(&mut self) -> &mut T {
+        // SAFETY: The type's contract ensures the value is always stored inline.
+        unsafe { self.inner.inline_ptr_mut().as_mut().unwrap_unchecked() }
     }
 }
 
@@ -324,26 +348,6 @@ impl<T: ?Sized, const N: usize, const A: usize> BigBox<T, N, A> {
         Self::uninit_from_boxed(Box::into_raw(boxed))
     }
 
-    unsafe fn copy_inline(value: *const T) -> Self {
-        // NB: we're storing the value inline, so `boxed` must be null.
-        let boxed = value.wrapping_byte_sub(value as *mut u8 as usize) as *mut T;
-        let mut inst = Self::uninit_from_boxed(boxed);
-
-        // SAFETY: This write is safe bceause:
-        // * `ptr` is non-null and live because it points into the `inline`
-        //   field of the stack-allocated `inst` object.
-        // * `ptr` is derefenceable because `T` is not bigger than `inline`.
-        // * `ptr` is correctly aligned because:
-        //   - `inst` is aligned to 8 bytes.
-        //   - Because of `repr(C)`, the same is true for the `inline` field.
-        //   - `T` must be aligned to no more than 8 bytes.
-        let ptr: *mut u8 = ptr::addr_of_mut!(inst.inline).cast();
-        let size = size_of_val(unsafe { value.as_ref().unwrap_unchecked() });
-        unsafe { ptr.copy_from_nonoverlapping(value.cast(), size) };
-
-        inst
-    }
-
     /// Creates a new [`BigBox`], storing [small] values inline.
     ///
     /// [small]: Self#which-values-can-be-stored-inline
@@ -351,33 +355,23 @@ impl<T: ?Sized, const N: usize, const A: usize> BigBox<T, N, A> {
     where
         T: FromSized<U>,
     {
-        if size_of::<U>() > N || align_of::<U>() > 8 {
-            let raw = Box::into_raw(Box::new(v));
+        match InlineBox::try_new(v) {
+            Ok(inline) => inline.into_big_box(),
+            Err(v) => {
+                // NB: we'd like to just call `Self::new_boxed(Box::new(v) as Box<T>)`,
+                // but this kind of cast doesn't work for any `T`, so we have to do it manually.
 
-            // SAFETY:
-            // * This pointer was just made from a call to `Box::into_raw`.
-            // * The contract of `FromSized` guarantees that
-            //   `fatten_pointer` doesn't change the pointer's address or provenance.
-            let boxed = unsafe { Box::from_raw(T::fatten_pointer(raw)) };
-            return Self::new_boxed(boxed);
+                let raw = Box::into_raw(Box::new(v));
+                let fat = T::fatten_pointer(raw);
+
+                // SAFETY:
+                // * This pointer was just made from a call to `Box::into_raw`.
+                // * The contract of `FromSized` guarantees that
+                //   `fatten_pointer` doesn't change the pointer's address or provenance.
+                let boxed = unsafe { Box::from_raw(fat) };
+                Self::new_boxed(boxed)
+            }
         }
-
-        // NB: `boxed` is null, but has the metadata of `T`.
-        let boxed = T::fatten_pointer(ptr::null_mut::<U>());
-        let mut inst = Self::uninit_from_boxed(boxed);
-
-        // SAFETY: This write is safe bceause:
-        // * `ptr` is non-null and live because it points into the `inline`
-        //   field of the stack-allocated `inst` object.
-        // * `ptr` is derefenceable because `T` is not bigger than `inline`.
-        // * `ptr` is correctly aligned because:
-        //   - `inst` is aligned to 8 bytes.
-        //   - Because of `repr(C)`, the same is true for the `inline` field.
-        //   - `T` must be aligned to no more than 8 bytes.
-        let ptr: *mut U = ptr::addr_of_mut!(inst.inline).cast();
-        unsafe { ptr.write(v) };
-
-        inst
     }
 
     /// Returns whether this `BigBox` is inline, rather than boxed.
@@ -407,36 +401,27 @@ impl<T: ?Sized, const N: usize, const A: usize> BigBox<T, N, A> {
     ///
     /// Note that this method will allocate if the `BigBox` is stored inline.
     pub fn into_boxed(self) -> Box<T> {
-        match self.take(|md| take_into_box(md)) {
+        match self.take() {
             BoxCapture::Boxed(boxed) => boxed,
-            BoxCapture::Inline(boxed) => boxed,
+            BoxCapture::Inline(inline) => take_into_box(inline),
         }
     }
 
     /// Consumes a [`BigBox`], returning the boxed form if it can, and calling `take_inline` on inline values.
-    ///
-    /// Note that the value behind the [`&mut ManuallyDrop`](ManuallyDrop) passed to `take_inline`
-    /// is guaranteed not to be used after the call to `take_inline` terminates,
-    /// and so `take_inline` is allowed to move out of the value from behind the reference.
-    pub fn take<U>(mut self, take_inline: impl FnOnce(Take<T, N, A>) -> U) -> BoxCapture<T, U> {
+    pub fn take(self) -> BoxCapture<T, InlineBox<T, N, A>> {
         let capture = if self.is_inline() {
-            let data_ptr = self.inline_ptr_mut();
-            // SAFETY: when the value is inline,
-            // `inline_ptr_mut` is valid for reads and writes,
-            // and `self` is never used again
-            // (including via drop, since `self` is forgotten).
-            let take = unsafe { Take::from_ptr(data_ptr) };
-            let value = take_inline(take);
-            BoxCapture::Inline(value)
+            // SAFETY: The value is inline.
+            let inline = unsafe { InlineBox::from_big_box(self) };
+            BoxCapture::Inline(inline)
         } else {
-            // SAFETY: when the value is not inline,
+            // SAFETY: When the value is not inline,
             // `boxed` is always constructed by `Box::into_raw`
             // and `self` is never used again
             // (including via drop, since `self` is forgotten).
             let boxed = unsafe { Box::from_raw(self.boxed) };
+            mem::forget(self);
             BoxCapture::Boxed(boxed)
         };
-        forget(self);
         capture
     }
 }
