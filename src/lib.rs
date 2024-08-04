@@ -252,6 +252,8 @@ pub enum BoxCapture<T: ?Sized, const N: usize, const A: usize> {
 ///
 /// The in-memory layout of this type should not be relied upon,
 /// and should be considered unstable.
+///
+/// [(small)]: Self#which-values-can-be-stored-inline
 #[cfg_attr(not(doc), repr(transparent))]
 pub struct InlineBox<T: ?Sized, const N: usize, const A: usize> {
     inner: ManuallyDrop<BigBox<T, N, A>>,
@@ -312,7 +314,7 @@ impl<T: ?Sized, const N: usize, const A: usize> InlineBox<T, N, A> {
     /// this is the same contract imposed by [`BigBox::new`]
     /// but is not enough to ensure correctness.
     ///
-    /// The caller must uphold that the reference points to a value of the type being read.
+    /// The caller must uphold that the held value is of the specified type.
     pub unsafe fn read_unchecked<U>(mut self) -> U
     where
         T: FromSized<U>,
@@ -423,7 +425,7 @@ impl<T: ?Sized, const N: usize, const A: usize> BigBox<T, N, A> {
         }
     }
 
-    /// Consumes a [`BigBox`], returning the boxed form if it can, and calling `take_inline` on inline values.
+    /// Consumes a [`BigBox`], returning the boxed form if it can, and an [`InlineBox`] otherwise.
     pub fn take(self) -> BoxCapture<T, N, A> {
         let capture = if self.is_inline() {
             // SAFETY: The value is inline.
