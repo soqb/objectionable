@@ -82,6 +82,7 @@
 use std::{
     alloc::Layout,
     borrow::{Borrow, BorrowMut},
+    cell::UnsafeCell,
     mem::{forget, transmute, ManuallyDrop, MaybeUninit},
     ptr,
 };
@@ -113,7 +114,7 @@ use std::{
 /// The type should be considered to have an unstable layout.
 #[repr(C, align(8))]
 pub struct BigBox<T: ?Sized, const N: usize, const A: usize = 8> {
-    inline: [MaybeUninit<u8>; N],
+    inline: UnsafeCell<[MaybeUninit<u8>; N]>,
     // if the data ptr of `boxed` is non-null,
     // it is a pointer to the actual data,
     // constructed with `Box::into_raw`.
@@ -124,6 +125,9 @@ pub struct BigBox<T: ?Sized, const N: usize, const A: usize = 8> {
     // aren't at all guaranteed, so we have store the whole ptr.
     boxed: *mut T,
 }
+
+unsafe impl<T: Send + ?Sized, const N: usize, const A: usize> Send for BigBox<T, N, A> {}
+unsafe impl<T: Sync + ?Sized, const N: usize, const A: usize> Sync for BigBox<T, N, A> {}
 
 /// This is effectively `data_ptr.with_metadata_of(boxed)` on stable.
 ///
@@ -307,22 +311,23 @@ impl<'a, T: ?Sized, const N: usize, const A: usize> Drop for Take<'a, T, N, A> {
 }
 
 impl<T: ?Sized, const N: usize, const A: usize> BigBox<T, N, A> {
+    fn uninit_from_boxed(boxed: *mut T) -> Self {
+        Self {
+            inline: UnsafeCell::new([MaybeUninit::uninit(); N]),
+            boxed,
+        }
+    }
+
     /// Creates a new, unconditionally boxed [`BigBox`].
     #[inline]
     pub fn new_boxed(boxed: Box<T>) -> Self {
-        Self {
-            inline: [MaybeUninit::uninit(); N],
-            boxed: Box::into_raw(boxed),
-        }
+        Self::uninit_from_boxed(Box::into_raw(boxed))
     }
 
     unsafe fn copy_inline(value: *const T) -> Self {
         // NB: we're storing the value inline, so `boxed` must be null.
         let boxed = value.wrapping_byte_sub(value as *mut u8 as usize) as *mut T;
-        let mut inst = Self {
-            inline: [MaybeUninit::uninit(); N],
-            boxed,
-        };
+        let mut inst = Self::uninit_from_boxed(boxed);
 
         // SAFETY: This write is safe bceause:
         // * `ptr` is non-null and live because it points into the `inline`
@@ -359,11 +364,7 @@ impl<T: ?Sized, const N: usize, const A: usize> BigBox<T, N, A> {
 
         // NB: `boxed` is null, but has the metadata of `T`.
         let boxed = T::fatten_pointer(ptr::null_mut::<U>());
-
-        let mut inst = Self {
-            inline: [MaybeUninit::uninit(); N],
-            boxed,
-        };
+        let mut inst = Self::uninit_from_boxed(boxed);
 
         // SAFETY: This write is safe bceause:
         // * `ptr` is non-null and live because it points into the `inline`
@@ -389,7 +390,7 @@ impl<T: ?Sized, const N: usize, const A: usize> BigBox<T, N, A> {
     /// [inline]: Self::is_inline
     fn inline_ptr(&self) -> *const T {
         // By definition, the data is inline
-        let data_start = self.inline.as_ptr();
+        let data_start = self.inline.get();
         copy_metadata(self.boxed, data_start.cast())
     }
 
@@ -398,7 +399,7 @@ impl<T: ?Sized, const N: usize, const A: usize> BigBox<T, N, A> {
     /// [inline]: Self::is_inline
     fn inline_ptr_mut(&mut self) -> *mut T {
         // By definition, the data is inline
-        let data_start = self.inline.as_mut_ptr();
+        let data_start = self.inline.get_mut().as_mut_ptr();
         copy_metadata(self.boxed, data_start.cast()).cast_mut()
     }
 
@@ -494,7 +495,11 @@ mod tests {
     use core::fmt::Debug;
     use std::{
         any::{Any, TypeId},
+        array::from_fn,
+        cell::Cell,
         marker::PhantomData,
+        sync::{Arc, Mutex},
+        thread::JoinHandle,
     };
 
     use crate::*;
@@ -506,7 +511,9 @@ mod tests {
         fn typeid(&self) -> TypeId;
     }
 
-    impl<T: 'static + Debug + Clone> Anything for T {
+    impl_from_sized_for_trait_object!(dyn Anything);
+
+    impl<T: 'static + Debug> Anything for T {
         fn as_any(&self) -> &dyn Any {
             self
         }
@@ -520,23 +527,26 @@ mod tests {
         }
     }
 
-    impl_from_sized_for_trait_object!(dyn Anything);
+    trait AnySync: Anything + Send + Sync {}
+    impl<T: Anything + Send + Sync> AnySync for T {}
+
+    impl_from_sized_for_trait_object!(dyn AnySync);
+
+    fn assert_roundtrip<T: Anything + PartialEq + Debug + Clone>(v: T) {
+        let dv = BigBox::<dyn Anything, 64, 8>::new(v.clone());
+        let v2: &T = dv.as_ref().as_any().downcast_ref().unwrap();
+        assert_eq!(v2, &v);
+
+        let boxed = dv.into_boxed();
+        println!("{boxed:?} vs {}", std::any::type_name::<T>());
+        println!("{:?} vs {:?}", boxed.typeid(), TypeId::of::<T>());
+
+        let v2: T = *boxed.into_any().downcast().unwrap();
+        assert_eq!(v2, v);
+    }
 
     #[test]
-    fn test_roundtrip() {
-        fn assert_roundtrip<T: Anything + PartialEq + Debug + Clone>(v: T) {
-            let dv = BigBox::<dyn Anything, 64, 8>::new(v.clone());
-            let v2: &T = dv.as_ref().as_any().downcast_ref().unwrap();
-            assert_eq!(v2, &v);
-
-            let boxed = dv.into_boxed();
-            println!("{boxed:?} vs {}", std::any::type_name::<T>());
-            println!("{:?} vs {:?}", boxed.typeid(), TypeId::of::<T>());
-
-            let v2: T = *boxed.into_any().downcast().unwrap();
-            assert_eq!(v2, v);
-        }
-
+    fn roundtrip() {
         assert_roundtrip(());
         assert_roundtrip(PhantomData::<&()>);
         assert_roundtrip(u8::MIN);
@@ -547,5 +557,57 @@ mod tests {
         assert_roundtrip(u128::MAX);
 
         assert_roundtrip([110_u8; 1000]);
+    }
+
+    #[test]
+    fn cell() {
+        let boxed: BigBox<dyn Anything, 64> = BigBox::new(Cell::new(5_u8));
+
+        let a: &Cell<u8> = boxed.as_ref().as_any().downcast_ref().unwrap();
+        let b: &Cell<u8> = boxed.as_ref().as_any().downcast_ref().unwrap();
+
+        a.set(10);
+        assert_eq!(a.get(), 10);
+        assert_eq!(b.get(), 10);
+        b.set(12);
+        assert_eq!(a.get(), 12);
+        assert_eq!(b.get(), 12);
+    }
+
+    #[test]
+    fn mutex() {
+        let mtx = Mutex::new(10_usize);
+        let boxed: BigBox<dyn AnySync, 64> = BigBox::new(mtx);
+        assert!(boxed.is_inline());
+        let arc = Arc::new(boxed);
+
+        let threads: [JoinHandle<()>; 10] = from_fn(|i| {
+            let arc = arc.clone();
+            std::thread::spawn(move || {
+                let mut num = arc
+                    .as_ref()
+                    .as_ref()
+                    .as_any()
+                    .downcast_ref::<Mutex<usize>>()
+                    .unwrap()
+                    .lock()
+                    .unwrap();
+                *num += i;
+            })
+        });
+
+        threads.into_iter().for_each(|td| td.join().unwrap());
+
+        let boxed = Arc::into_inner(arc).unwrap();
+        assert_eq!(
+            *boxed
+                .into_boxed()
+                .into_any()
+                .downcast::<Mutex<usize>>()
+                .unwrap()
+                .get_mut()
+                .unwrap(),
+            55,
+        );
     }
 }
