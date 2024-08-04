@@ -82,7 +82,7 @@
 use std::{
     alloc::Layout,
     cell::UnsafeCell,
-    mem::{self, MaybeUninit},
+    mem::{self, ManuallyDrop, MaybeUninit},
     ptr,
 };
 
@@ -212,6 +212,7 @@ pub unsafe trait FromSized<T> {
 #[macro_export]
 macro_rules! impl_from_sized_for_trait_object {
     (dyn $trait:path) => {
+        // SAFETY: sized-type-to-trait-object pointer cast uses the vtable as the pointer metadata.
         unsafe impl<T: $trait> $crate::FromSized<T> for dyn $trait {
             fn fatten_pointer(thin: *mut T) -> *mut Self {
                 thin as *mut Self
@@ -227,13 +228,20 @@ unsafe impl<T> FromSized<T> for T {
     }
 }
 
+// SAFETY: array-to-slice pointer cast uses the array length as the pointer metadata.
+unsafe impl<T, const N: usize> FromSized<[T; N]> for [T] {
+    fn fatten_pointer(thin: *mut [T; N]) -> *mut Self {
+        thin as *mut Self
+    }
+}
+
 /// Represents the result of a [`BigBox::take`] operation.
 ///
 /// See that method for more detailed documentation.
 #[allow(missing_docs)]
-pub enum BoxCapture<T: ?Sized, U> {
+pub enum BoxCapture<T: ?Sized, const N: usize, const A: usize> {
     Boxed(Box<T>),
-    Inline(U),
+    Inline(InlineBox<T, N, A>),
 }
 
 /// A box which stores its [(small)] value inline.
@@ -246,7 +254,7 @@ pub enum BoxCapture<T: ?Sized, U> {
 /// and should be considered unstable.
 #[cfg_attr(not(doc), repr(transparent))]
 pub struct InlineBox<T: ?Sized, const N: usize, const A: usize> {
-    pub(self) inner: BigBox<T, N, A>,
+    inner: ManuallyDrop<BigBox<T, N, A>>,
 }
 
 impl<T: ?Sized, const N: usize, const A: usize> InlineBox<T, N, A> {
@@ -255,12 +263,9 @@ impl<T: ?Sized, const N: usize, const A: usize> InlineBox<T, N, A> {
     /// The `BigBox` must have its value stored inline.
     unsafe fn from_big_box(big_box: BigBox<T, N, A>) -> Self {
         debug_assert!(big_box.is_inline());
-        Self { inner: big_box }
-    }
-
-    /// Turns this reference into a [`BigBox`] identical to the one it was constructed from.
-    pub fn into_big_box(self) -> BigBox<T, N, A> {
-        self.inner
+        Self {
+            inner: ManuallyDrop::new(big_box),
+        }
     }
 
     /// Attempts to construct an [`InlineBox`], failing if the value is not [small].
@@ -333,6 +338,23 @@ impl<T: ?Sized, const N: usize, const A: usize> AsMut<T> for InlineBox<T, N, A> 
         unsafe { self.inner.inline_ptr_mut().as_mut().unwrap_unchecked() }
     }
 }
+impl<T: ?Sized, const N: usize, const A: usize> Drop for InlineBox<T, N, A> {
+    fn drop(&mut self) {
+        // SAFETY:
+        // * The type's contract ensures the value is always stored inline.
+        // * Since this is the tail of `Drop::drop`, the value behind it is never used again.
+        unsafe { self.inner.inline_ptr_mut().drop_in_place() };
+    }
+}
+
+impl<T: ?Sized, const N: usize, const A: usize> From<InlineBox<T, N, A>> for BigBox<T, N, A> {
+    fn from(mut value: InlineBox<T, N, A>) -> Self {
+        // SAFETY: `value` is immediately forgotten.
+        let big_box = unsafe { ManuallyDrop::take(&mut value.inner) };
+        mem::forget(value);
+        big_box
+    }
+}
 
 impl<T: ?Sized, const N: usize, const A: usize> BigBox<T, N, A> {
     fn uninit_from_boxed(boxed: *mut T) -> Self {
@@ -356,20 +378,14 @@ impl<T: ?Sized, const N: usize, const A: usize> BigBox<T, N, A> {
         T: FromSized<U>,
     {
         match InlineBox::try_new(v) {
-            Ok(inline) => inline.into_big_box(),
+            Ok(inline) => inline.into(),
             Err(v) => {
                 // NB: we'd like to just call `Self::new_boxed(Box::new(v) as Box<T>)`,
                 // but this kind of cast doesn't work for any `T`, so we have to do it manually.
 
                 let raw = Box::into_raw(Box::new(v));
                 let fat = T::fatten_pointer(raw);
-
-                // SAFETY:
-                // * This pointer was just made from a call to `Box::into_raw`.
-                // * The contract of `FromSized` guarantees that
-                //   `fatten_pointer` doesn't change the pointer's address or provenance.
-                let boxed = unsafe { Box::from_raw(fat) };
-                Self::new_boxed(boxed)
+                Self::uninit_from_boxed(fat)
             }
         }
     }
@@ -408,7 +424,7 @@ impl<T: ?Sized, const N: usize, const A: usize> BigBox<T, N, A> {
     }
 
     /// Consumes a [`BigBox`], returning the boxed form if it can, and calling `take_inline` on inline values.
-    pub fn take(self) -> BoxCapture<T, InlineBox<T, N, A>> {
+    pub fn take(self) -> BoxCapture<T, N, A> {
         let capture = if self.is_inline() {
             // SAFETY: The value is inline.
             let inline = unsafe { InlineBox::from_big_box(self) };
@@ -458,6 +474,8 @@ impl<T: ?Sized, const N: usize, const A: usize> AsMut<T> for BigBox<T, N, A> {
 
 impl<T: ?Sized, const N: usize, const A: usize> Drop for BigBox<T, N, A> {
     fn drop(&mut self) {
+        // NB: this effectively the same as just using `self.take()`
+        // but is simpler than jumping through `ManuallyDrop` hoops.
         if self.is_inline() {
             // SAFETY:
             // * `inline_ptr_mut` returns a valid pointer to the data,
