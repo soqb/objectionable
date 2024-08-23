@@ -10,10 +10,17 @@
 //!
 //! See [`BigBox`] and [`InlineBox`] for the crate's central interface.
 //!
-//! # Soundness
+#![cfg_attr(
+    doc,
+    doc = document_features::document_features!(
+        feature_label = r##"<a class="stab portability" id="feature-{feature}" href="#feature-{feature}"><code>{feature}</code></a>"##
+    ),
+)]
 //!
-//! When the <span class="stab portability"><code>strict-provenance</code></span> crate feature is enabled,
-//! this crate uses unstable APIs[^1] for sound execution under [the experimental strict provenance memory model]
+//! # Soundness & Memory Model
+//!
+//! When the <a class="stab portability" href="#feature-strict-provenance"><code>strict-provenance</code></a> crate feature is enabled,
+//! this crate uses unstable APIs[^1] for sound execution under [the experimental strict provenance memory model][rust-strictp]
 //! and to support passing the test suite under [Miri].
 //!
 //! When this feature is disabled, this crate tries to replicate the unstable methods
@@ -25,7 +32,7 @@
 //!
 //! Bear in mind that this project is developped as a hobby, and is not formally verified.
 //! There may be undiscovered unsoundness in untested edge cases.
-//! Issues and PRs are welcome at the linked repository page.
+//! [Issues] and [PRs] are welcome.
 //!
 //! [^1]: Notably, Rust's
 //!     <a class="stab portability" href="https://github.com/rust-lang/rust/issues/95228"><code>strict_provenance</code></a>
@@ -33,7 +40,9 @@
 //!     <a class="stab portability" href="https://github.com/rust-lang/rust/issues/81513"><code>ptr_metadata</code></a>
 //!     features are enabled.
 //!
-//! [the experimental strict provenance memory model]: core::ptr#strict-provenance
+//! [Issues]: https://github.com/soqb/objectionable/issues
+//! [PRs]: https://github.com/soqb/objectionable/pulls
+//! [rust-strictp]: core::ptr#strict-provenance
 //! [Miri]: https://github.com/rust-lang/miri
 //!
 //! # Examples
@@ -260,7 +269,7 @@ unsafe impl<T, const N: usize> FromSized<[T; N]> for [T] {
 /// A box which stores its [(small)] value inline.
 ///
 #[cfg_attr(
-    not(feature = "alloc"),
+    feature = "alloc",
     doc = "This is identical to a [`BigBox`] which always stores its contents on the stack."
 )]
 #[cfg_attr(
@@ -326,7 +335,7 @@ impl<T: ?Sized, const N: usize, const A: usize> InlineBox<T, N, A> {
         // but the performance payoff of `ptr::write` over `ptr::copy_nonoverlapping`
         // is too compelling to pass up on.
         cx: U,
-        writer: impl FnOnce(U, *mut MaybeUninit<u8>),
+        writer: impl FnOnce(U, *mut u8),
     ) -> Result<Self, U> {
         if layout.size() > N || layout.align() > 8 {
             return Err(cx);
@@ -336,15 +345,7 @@ impl<T: ?Sized, const N: usize, const A: usize> InlineBox<T, N, A> {
         let boxed = copy_metadata(meta, ptr::null()).cast_mut();
         let mut inst = BigBox::uninit_from_boxed(boxed);
 
-        // SAFETY: This write is safe because:
-        // * `ptr` is non-null and live because it points into the `inline`
-        //   field of the stack-allocated `inst` object.
-        // * `ptr` is derefenceable because `T` is not bigger than `inline`.
-        // * `ptr` is correctly aligned because:
-        //   - `inst` is aligned to 8 bytes.
-        //   - Because of `repr(C)`, the same is true for the `inline` field.
-        //   - `T` must be aligned to no more than 8 bytes.
-        let dst: *mut MaybeUninit<u8> = inst.inline.get_mut().as_mut_ptr();
+        let dst: *mut u8 = inst.inline.get_mut().as_mut_ptr().cast();
         writer(cx, dst);
         // unsafe { ptr::copy_nonoverlapping(src.cast(), dst, layout.size()) };
         // unsafe { dst.write(v) };
@@ -388,8 +389,16 @@ impl<T: Copy, const N: usize, const A: usize> TryFrom<&[T]> for InlineBox<[T], N
     type Error = TooLarge;
 
     fn try_from(v: &[T]) -> Result<Self, TooLarge> {
-        fn copy_slice<T>(v: &[T], dst: *mut MaybeUninit<u8>) {
-            unsafe { ptr::copy_nonoverlapping(v.as_ptr().cast(), dst, size_of_val(v)) }
+        fn copy_slice<T>(v: &[T], dst: *mut u8) {
+            // SAFETY: This write is safe (in the context `copy_slice` is called) because:
+            // * `dst` is non-null and live because it points into the `inline`
+            //   field of a stack-allocated `BigBox` object.
+            // * `dst` is derefenceable because the `[T]` instance is certainly not bigger than `inline`.
+            // * `ptr` is correctly aligned because:
+            //   - `BigBox` is aligned to 8 bytes.
+            //   - Because of `repr(C)`, the same is true for the `inline` field.
+            //   - The `[T]` instance must be aligned to no more than 8 bytes.
+            unsafe { ptr::copy_nonoverlapping(v.as_ptr(), dst.cast(), v.len()) }
         }
 
         let attempt = unsafe { Self::try_copy_raw(Layout::for_value(v), v, v, copy_slice) };
@@ -755,13 +764,23 @@ mod tests {
 
     #[test]
     fn conversions() {
+        type B<T> = BigBox<T, 32>;
+
         let a = "the pink champagne on ice.";
         let b = "all the leaves are brown and the sky is gray.";
 
-        type B<T> = BigBox<T, 32>;
-
         let a_boxed: B<str> = B::from(a);
         let b_boxed: B<str> = B::from(b);
+        assert!(a_boxed.is_inline() && !b_boxed.is_inline());
+
+        assert_eq!(a_boxed.as_ref(), a);
+        assert_eq!(b_boxed.as_ref(), b);
+
+        let a: &[u32] = &[150u32; 2];
+        let b: &[u32] = &[159u32; 40];
+
+        let a_boxed: B<[u32]> = B::from(a);
+        let b_boxed: B<[u32]> = B::from(b);
         assert!(a_boxed.is_inline() && !b_boxed.is_inline());
 
         assert_eq!(a_boxed.as_ref(), a);

@@ -8,7 +8,18 @@ repository = "https://github.com/soqb/objectionable"
 categories = ["no-std", "no-std::no-alloc", "rust-patterns"]
 keywords = ["alloc", "box", "trait-objects", "unsized"]
 
+[dependencies]
+document-features = "0.2.10"
+
 [features]
 default = ["alloc"]
+
+# NB: we use the `document-features` crate.
+#! # Feature Flags
+
+## Enable a dependency on `alloc` to allow boxing values on the heap.
 alloc = []
+
+## Support sound execution under the [the experimental strict provenance memory model][rust-strictp].
+## See [the section on soundness](#soundness--memory-model) for more details.
 strict-provenance = []
