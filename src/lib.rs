@@ -24,8 +24,8 @@
 //! but when interacting with strict provenance, *the aforementioned feature is required*.
 //!
 //! Bear in mind that this project is developped as a hobby, and is not formally verified.
-//! There may be undiscovered unsoundness in untested edge cases,
-//! issues and PRs are welcome at the linked repository page.
+//! There may be undiscovered unsoundness in untested edge cases.
+//! Issues and PRs are welcome at the linked repository page.
 //!
 //! [^1]: Notably, Rust's
 //!     <a class="stab portability" href="https://github.com/rust-lang/rust/issues/95228"><code>strict_provenance</code></a>
